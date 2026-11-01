@@ -1,0 +1,20 @@
+-- Layer 3: one target table per country. {table} is filled in by the pipeline (tgt_member_in, tgt_member_ca, ...).
+CREATE TABLE IF NOT EXISTS {table} (
+    member_id        VARCHAR PRIMARY KEY,
+    member_name      VARCHAR NOT NULL,
+    enrollment_date  DATE    NOT NULL,
+    last_flight_date DATE,
+    tier_code        VARCHAR,
+    agent_name       VARCHAR,
+    state            VARCHAR,
+    country_iso2     VARCHAR NOT NULL,
+    post_code        VARCHAR,
+    dob              DATE,
+    is_active        VARCHAR,
+    age              INTEGER,
+    stale_member     BOOLEAN,
+    source_file      VARCHAR NOT NULL,
+    file_date        DATE    NOT NULL,
+    loaded_at        TIMESTAMP DEFAULT current_timestamp
+);
+-- Snowflake: ALTER TABLE {table} CLUSTER BY (member_id);
