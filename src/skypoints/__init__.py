@@ -1,0 +1,1 @@
+"""SkyPoints member ETL: splits loyalty members by country and flattens partner redemptions."""
