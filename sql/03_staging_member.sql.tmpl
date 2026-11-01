@@ -1,0 +1,74 @@
+-- Layer 2: STAGING. Types applied, country standardised, Age and Stale_Member derived.
+-- Rows that fail a rule are kept (with a reason) in stg_member_all, then split into stg_member and quarantine.
+-- Parameters of the first statement: ? = file_name. Second statement: ? = run_date (x3), the file date,
+-- so reruns give identical answers.
+CREATE OR REPLACE TABLE stg_member_all AS
+WITH n AS (
+    -- trim, then blank or literal NULL/N/A text becomes a real NULL. raw_member_file itself is never modified.
+    SELECT r.file_name, r.file_date, r.row_num,
+           CASE WHEN upper(trim(r.member_name)) IN ({null_tokens}) THEN NULL ELSE NULLIF(trim(r.member_name), '') END AS member_name,
+           CASE WHEN upper(trim(r.member_id)) IN ({null_tokens}) THEN NULL ELSE NULLIF(trim(r.member_id), '') END AS member_id,
+           CASE WHEN upper(trim(r.enrollment_date)) IN ({null_tokens}) THEN NULL ELSE NULLIF(trim(r.enrollment_date), '') END AS enrollment_date,
+           CASE WHEN upper(trim(r.last_flight_date)) IN ({null_tokens}) THEN NULL ELSE NULLIF(trim(r.last_flight_date), '') END AS last_flight_date,
+           CASE WHEN upper(trim(r.tier_code)) IN ({null_tokens}) THEN NULL ELSE NULLIF(trim(r.tier_code), '') END AS tier_code,
+           CASE WHEN upper(trim(r.agent_name)) IN ({null_tokens}) THEN NULL ELSE NULLIF(trim(r.agent_name), '') END AS agent_name,
+           CASE WHEN upper(trim(r.state)) IN ({null_tokens}) THEN NULL ELSE NULLIF(trim(r.state), '') END AS state,
+           CASE WHEN upper(trim(r.country)) IN ({null_tokens}) THEN NULL ELSE NULLIF(trim(r.country), '') END AS country,
+           CASE WHEN upper(trim(r.post_code)) IN ({null_tokens}) THEN NULL ELSE NULLIF(trim(r.post_code), '') END AS post_code,
+           CASE WHEN upper(trim(r.dob)) IN ({null_tokens}) THEN NULL ELSE NULLIF(trim(r.dob), '') END AS dob,
+           CASE WHEN upper(trim(r.is_active)) IN ({null_tokens}) THEN NULL ELSE NULLIF(trim(r.is_active), '') END AS is_active
+    FROM raw_member_file r
+    WHERE r.file_name = ? AND r.row_num > 1
+),
+c AS (
+    SELECT
+        n.file_name, n.file_date, n.row_num,
+        n.member_name,
+        n.member_id,
+        CAST(try_strptime(n.enrollment_date,  '{date_fmt}') AS DATE) AS enrollment_date,
+        CAST(try_strptime(n.last_flight_date, '{date_fmt}') AS DATE) AS last_flight_date,
+        upper(n.tier_code)                                          AS tier_code,
+        n.agent_name,
+        upper(n.state)                                              AS state,
+        cm.country_iso2                                             AS country_iso2,
+        n.post_code,
+        -- upstream staging stores DOB as a number and drops the leading zero (3051985): pad 7 digits back to 8
+        CAST(try_strptime(CASE WHEN regexp_matches(n.dob, '^[0-9]{{7}}$') THEN lpad(n.dob, 8, '0') ELSE n.dob END,
+                          '{dob_fmt}') AS DATE)                     AS dob,
+        upper(n.is_active)                                          AS is_active
+    FROM n
+    LEFT JOIN country_map cm ON upper(n.country) = cm.raw_value
+),
+v AS (
+    SELECT *, CASE
+        WHEN member_name IS NULL     THEN 'missing_member_name'
+        WHEN member_id IS NULL       THEN 'missing_member_id'
+        WHEN enrollment_date IS NULL THEN 'invalid_enrollment_date'
+        WHEN length(member_name) > {len_name} OR length(member_id) > {len_id} OR length(tier_code) > {len_tier}
+             OR length(state) > {len_state} OR length(agent_name) > {len_name} OR length(is_active) > 1 THEN 'field_exceeds_max_length'
+        WHEN country_iso2 IS NULL    THEN 'unknown_or_missing_country'
+    END AS reject_reason
+    FROM c
+),
+d AS (
+    SELECT row_num, row_number() OVER (PARTITION BY member_id ORDER BY row_num DESC) AS rn
+    FROM v WHERE reject_reason IS NULL
+)
+SELECT v.*,
+       CASE WHEN v.reject_reason IS NOT NULL THEN v.reject_reason
+            WHEN d.rn > 1 THEN 'duplicate_member_in_file' END AS final_reason
+FROM v LEFT JOIN d ON v.row_num = d.row_num;
+
+CREATE OR REPLACE TABLE stg_member AS
+SELECT
+    file_name, file_date, row_num, member_id, member_name, enrollment_date, last_flight_date,
+    tier_code, agent_name, state, country_iso2, post_code, dob, is_active,
+    CASE WHEN dob IS NULL THEN NULL
+         ELSE date_diff('year', dob, CAST(? AS DATE))
+              - CASE WHEN strftime(CAST(? AS DATE), '%m%d') < strftime(dob, '%m%d') THEN 1 ELSE 0 END
+    END AS age,
+    CASE WHEN last_flight_date IS NULL THEN NULL
+         ELSE date_diff('day', last_flight_date, CAST(? AS DATE)) > {stale_days}
+    END AS stale_member
+FROM stg_member_all
+WHERE final_reason IS NULL;
